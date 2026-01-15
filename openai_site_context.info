@@ -1,0 +1,8 @@
+name = OpenAI Site Context
+description = Provides global site context prompts for OpenAI modules.
+package = OpenAI
+backdrop = 1.x
+type = module
+dependencies[] = openai
+configure = admin/config/openai/site-context
+

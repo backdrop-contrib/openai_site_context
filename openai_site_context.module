@@ -1,0 +1,187 @@
+<?php
+
+/**
+ * Implements hook_config_info().
+ */
+function openai_site_context_config_info() {
+  return [
+    'openai_site_context.settings' => [
+      'label' => t('OpenAI Site Context Settings'),
+      'group' => t('Configuration'),
+    ],
+  ];
+}
+
+/**
+ * Implements hook_menu().
+ */
+function openai_site_context_menu() {
+  $items = [];
+
+  $items['admin/config/openai/site-context'] = [
+    'title' => 'OpenAI Site Context',
+    'description' => 'Configure global site context prompts for OpenAI modules.',
+    'page callback' => 'backdrop_get_form',
+    'page arguments' => ['openai_site_context_settings_form'],
+    'access arguments' => ['administer site configuration'],
+  ];
+
+  return $items;
+}
+
+/**
+ * Settings form.
+ */
+function openai_site_context_settings_form($form, &$form_state) {
+  $form = [];
+  $form['#config'] = 'openai_site_context.settings';
+
+  $config = config('openai_site_context.settings');
+
+  $form['enabled'] = [
+    '#type' => 'checkbox',
+    '#title' => t('Enable site context injection'),
+    '#description' => t('When enabled, the guardrails and global site context will be injected into OpenAI prompts/messages. Disable to test behavior without site context.'),
+    '#default_value' => $config->get('enabled') !== NULL ? (bool) $config->get('enabled') : TRUE,
+  ];
+
+  $form['guardrails'] = [
+    '#type' => 'textarea',
+    '#title' => t('Guardrails Prompt'),
+    '#description' => t('Safety and ethical guidelines to prepend to all OpenAI API calls. This ensures AI responses align with site policies and avoid harmful content. Tokens are supported.'),
+    '#default_value' => $config->get('guardrails') ?: '',
+    '#rows' => 8,
+  ];
+
+  $form['global_prompt'] = [
+    '#type' => 'textarea',
+    '#title' => t('Global Site Context Prompt'),
+    '#description' => t('Additional site-specific context and instructions to prepend after guardrails. Use tokens (for example: [site:name]).'),
+    '#default_value' => $config->get('global_prompt') ?: '',
+    '#rows' => 10,
+  ];
+
+  $form['token_browser'] = [
+    '#type' => 'fieldset',
+    '#title' => t('Token browser'),
+    '#collapsible' => TRUE,
+    '#collapsed' => TRUE,
+    '#description' => t('Browse all available tokens. Some tokens require runtime data and may only work in certain contexts.'),
+  ];
+
+  // Provide a token browser link (dialog) like other modules.
+  // Leaving token_types/global_types empty allows browsing all token types.
+  $form['token_browser']['browser'] = [
+    '#type' => 'item',
+    '#title' => t('Available tokens'),
+    '#markup' => theme('token_tree', [
+      'dialog' => TRUE,
+      'text' => t('Browse available tokens'),
+      'token_types' => [],
+      'global_types' => [],
+      'show_restricted' => FALSE,
+      'click_insert' => TRUE,
+    ]),
+  ];
+
+  return system_settings_form($form);
+}
+
+/**
+ * Helper function to get the combined guardrails and global prompt.
+ */
+function openai_site_context_get_prompt() {
+  $config = config('openai_site_context.settings');
+  // If disabled, return empty string so no changes are applied.
+  if ($config->get('enabled') === 0 || $config->get('enabled') === '0') {
+    return '';
+  }
+  $guardrails = $config->get('guardrails') ?: '';
+  $global_prompt = $config->get('global_prompt') ?: '';
+
+  $combined = '';
+  if (!empty($guardrails)) {
+    $combined .= $guardrails . "\n\n";
+  }
+  $combined .= $global_prompt;
+
+  // Replace tokens using the Token system, so all token types are supported
+  // (subject to available runtime data).
+  $combined = token_replace($combined, [], ['sanitize' => FALSE]);
+
+  return $combined;
+}
+
+/**
+ * Implements hook_openai_prompt_alter().
+ *
+ * Prepend site context to non-chat prompts, except during embedding generation.
+ */
+function openai_site_context_openai_prompt_alter(&$prompt, array $context) {
+  if (!empty($context['disable_site_context'])) {
+    return;
+  }
+  // Skip during embedding generation to avoid corrupting vectors.
+  if (!empty($context['operation']) && $context['operation'] === 'embedding_generate') {
+    return;
+  }
+
+  $site = trim(openai_site_context_get_prompt());
+  if ($site !== '') {
+    $prompt = trim($site . "\n\n" . $prompt);
+
+    // Log a short, redacted note that site context was injected for prompt ops.
+    // Helps verify behavior when users say logs are missing.
+    $max_chars = 180;
+    $preview = $site;
+    if (function_exists('backdrop_strlen') && backdrop_strlen($preview) > $max_chars) {
+      $preview = backdrop_substr($preview, 0, $max_chars) . '… [truncated]';
+    }
+    elseif (!function_exists('backdrop_strlen') && strlen($preview) > $max_chars) {
+      $preview = substr($preview, 0, $max_chars) . '… [truncated]';
+    }
+    watchdog('openai', 'Site context injected (prompt). Operation: @op. Length: @len. Preview: @preview', [
+      '@op' => isset($context['operation']) ? $context['operation'] : 'n/a',
+      '@len' => strlen($site),
+      '@preview' => $preview,
+    ], WATCHDOG_INFO);
+  }
+}
+
+/**
+ * Implements hook_openai_chat_messages_alter().
+ *
+ * Prepend site context as a system message for chat payloads.
+ */
+function openai_site_context_openai_chat_messages_alter(array &$messages, array $context) {
+  if (!empty($context['disable_site_context'])) {
+    return;
+  }
+  if (!empty($context['operation']) && $context['operation'] === 'embedding_generate') {
+    return;
+  }
+
+  $site = trim(openai_site_context_get_prompt());
+  if ($site !== '') {
+    array_unshift($messages, [
+      'role' => 'system',
+      'content' => $site,
+    ]);
+
+    // Log a short, redacted note that site context was injected for chat ops.
+    $max_chars = 180;
+    $preview = $site;
+    if (function_exists('backdrop_strlen') && backdrop_strlen($preview) > $max_chars) {
+      $preview = backdrop_substr($preview, 0, $max_chars) . '… [truncated]';
+    }
+    elseif (!function_exists('backdrop_strlen') && strlen($preview) > $max_chars) {
+      $preview = substr($preview, 0, $max_chars) . '… [truncated]';
+    }
+    watchdog('openai', 'Site context injected (chat). Operation: @op. Messages: @count. Length: @len. Preview: @preview', [
+      '@op' => isset($context['operation']) ? $context['operation'] : 'n/a',
+      '@count' => count($messages),
+      '@len' => strlen($site),
+      '@preview' => $preview,
+    ], WATCHDOG_INFO);
+  }
+}
